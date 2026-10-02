@@ -20,6 +20,7 @@ def _raise_runtime_error() -> None:
 
 def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
 
     # The RSS fixture gives us paper IDs.  After feedparser, the code calls
     # arxiv.Client().results(search) which makes real HTTP requests.  We mock
@@ -45,7 +46,7 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
 
     class FakeClient:
         def __init__(self, **kw):
-            pass
+            self._session = SimpleNamespace(close=lambda: None)
         def results(self, search):
             return iter(fake_results)
 
