@@ -184,6 +184,20 @@ cd zotero-arxiv-daily
 uv run main.py
 ```
 
+### arXiv API retries
+Metadata requests run serially in batches of 20 with at least 10 seconds between
+requests. Each batch gets at most 5 attempts for HTTP 429, 500, 502, 503, 504,
+connection/time-out errors, or incomplete results. The SDK's own retries are
+disabled to avoid multiplying requests. Retries use exponential backoff with
+jitter, capped at 120 seconds, and honor a valid `Retry-After` header up to 300
+seconds. A longer server cooldown stops the run instead of retrying too early.
+Requests use a 10-second connect and 60-second read timeout.
+
+Exhausted batches fail the run before ranking or email delivery rather than
+silently sending a partial digest. There is no persistent metadata cache, so a
+new run fetches metadata again. The offline regression tests can be run with
+`uv run pytest tests/retriever/test_arxiv_retries.py`.
+
 ## 🚀 Sync with the latest version
 This project is in active development. You can subscribe this repo via `Watch` so that you can be notified once we publish new release.
 

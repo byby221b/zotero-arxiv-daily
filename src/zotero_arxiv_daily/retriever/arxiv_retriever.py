@@ -8,8 +8,13 @@ import feedparser
 from tqdm import tqdm
 import multiprocessing
 import os
+import math
+import random
+import re
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from queue import Empty
-from time import sleep
+from time import sleep, time
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -19,6 +24,117 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+ARXIV_BATCH_SIZE = 20
+ARXIV_REQUEST_DELAY = 10
+ARXIV_MAX_ATTEMPTS = 5
+ARXIV_BACKOFF_BASE = 30
+ARXIV_BACKOFF_CAP = 120
+ARXIV_MAX_RETRY_AFTER = 300
+ARXIV_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+class _ArxivSession(requests.Session):
+    """Keep response headers that arxiv 2.4.1's HTTPError discards."""
+
+    def __init__(self):
+        super().__init__()
+        self.retry_after: str | None = None
+
+    def get(self, url, **kwargs):
+        # Reset before every request, including requests that raise a timeout.
+        self.retry_after = None
+        kwargs.setdefault("timeout", DOWNLOAD_TIMEOUT)
+        response = super().get(url, **kwargs)
+        self.retry_after = response.headers.get("Retry-After")
+        return response
+
+
+def _create_arxiv_client() -> arxiv.Client:
+    # The outer batch loop is the only retry owner. The SDK still serializes
+    # requests and enforces spacing, including any pagination within a batch.
+    client = arxiv.Client(
+        page_size=ARXIV_BATCH_SIZE, num_retries=0, delay_seconds=ARXIV_REQUEST_DELAY
+    )
+    # arxiv 2.4.1 has no public timeout/session option. Keep this small adapter
+    # covered by a real-SDK test when upgrading the dependency.
+    client._session.close()
+    client._session = _ArxivSession()
+    return client
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = max(0.0, retry_at.timestamp() - time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+class _IncompleteArxivBatchError(RuntimeError):
+    pass
+
+
+def _validate_arxiv_batch(batch: list[ArxivResult], paper_ids: list[str]) -> None:
+    """Do not mistake an empty/partial API response for a successful batch."""
+    returned_ids = [paper.entry_id.split("arxiv.org/abs/")[-1] for paper in batch]
+    requested_ids = set(paper_ids)
+    # RSS IDs can be unversioned. Explicit versions must still match exactly.
+    matched_ids = [
+        result_id if result_id in requested_ids else re.sub(r"v\d+$", "", result_id)
+        for result_id in returned_ids
+    ]
+    if len(matched_ids) != len(paper_ids) or set(matched_ids) != requested_ids:
+        raise _IncompleteArxivBatchError(
+            f"arXiv returned incomplete or mismatched metadata for {len(paper_ids)} requested papers"
+        )
+
+
+def _retrieve_arxiv_batch(client: arxiv.Client, paper_ids: list[str]) -> list[ArxivResult]:
+    search = arxiv.Search(id_list=paper_ids, max_results=len(paper_ids))
+    for attempt in range(ARXIV_MAX_ATTEMPTS):
+        try:
+            # Materialize before committing results, so a generator failure
+            # cannot duplicate or leak a partially retrieved batch downstream.
+            batch = list(client.results(search))
+            _validate_arxiv_batch(batch, paper_ids)
+            return batch
+        except (
+            arxiv.HTTPError,
+            arxiv.UnexpectedEmptyPageError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            _IncompleteArxivBatchError,
+        ) as exc:
+            if isinstance(exc, requests.exceptions.SSLError):
+                raise
+            if isinstance(exc, arxiv.HTTPError) and exc.status not in ARXIV_RETRYABLE_STATUSES:
+                raise
+            if attempt == ARXIV_MAX_ATTEMPTS - 1:
+                logger.error(f"arXiv metadata batch failed after {ARXIV_MAX_ATTEMPTS} attempts: {exc}")
+                raise
+            retry_after = (
+                _retry_after_seconds(client._session.retry_after)
+                if isinstance(exc, arxiv.HTTPError) else None
+            )
+            if retry_after is not None and retry_after > ARXIV_MAX_RETRY_AFTER:
+                # Do not shorten a server's cooldown to fit our retry budget.
+                logger.error(f"arXiv requested a {retry_after:.0f}s cooldown; stopping this run")
+                raise
+            backoff = min(ARXIV_BACKOFF_CAP, ARXIV_BACKOFF_BASE * 2 ** attempt)
+            wait = min(ARXIV_BACKOFF_CAP, backoff + random.uniform(0, 10))
+            wait = max(wait, retry_after or 0)
+            logger.warning(
+                f"arXiv metadata batch failed ({exc}); retry {attempt + 2}/{ARXIV_MAX_ATTEMPTS} in {wait:.1f}s"
+            )
+            sleep(wait)
 
 
 def _download_file(url: str, path: str) -> None:
@@ -114,7 +230,6 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -123,36 +238,28 @@ class ArxivRetriever(BaseRetriever):
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
+        all_paper_ids = list(dict.fromkeys(
             i.id.removeprefix("oai:arXiv.org:")
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
-        ]
+        ))
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
+        if not all_paper_ids:
+            return []
 
         # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
+        # Include the preceding RSS request in our conservative pacing.
+        sleep(ARXIV_REQUEST_DELAY)
+        client = _create_arxiv_client()
+        try:
+            with tqdm(total=len(all_paper_ids)) as bar:
+                for i in range(0, len(all_paper_ids), ARXIV_BATCH_SIZE):
+                    batch = _retrieve_arxiv_batch(client, all_paper_ids[i:i + ARXIV_BATCH_SIZE])
                     bar.update(len(batch))
                     raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
+        finally:
+            client._session.close()
 
         return raw_papers
 
